@@ -1,0 +1,176 @@
+= Cassandra - Working around Tuple
+Antoine Duprat <aduprat@linagora.com>; lgs-openpaas-dev <lgs-openpaas-dev@linagora.com>;
+:imagesdir: images
+:numbered:
+:sectlink:
+:sectids:
+:toc: left
+:toclevels: 2
+:icons: font
+:source-highlighter: coderay
+:coderay-css: style
+
+== Needs
+
+In a current development, we have to store some _properties_ in a *Cassandra* table. +
+Such _properties_ can be represented as the following class:
+[source,java,linenums]
+----
+public class Property {
+
+    private final String namespace;
+    private final String localName;
+    private final String value;
+    
+    public Property(String namespace, String localName, String value) {
+        this.namespace = namespace;
+        this.localName = localName;
+        this.value = value;
+    }
+...
+----
+
+Where:
+
+- `namespace`: is part of the composed key
+- `localName`: is the second part of the composed key
+- `value`: is the corresponding value
+
+We may use a map for such data, but we don't wanted to create a user-defined type for the key. +
+The last constraint was that we want to store those _properties_ as a simple column in *Cassandra*. +
+So that's why we choose to look at lists of tuple.
+
+== CQL
+
+First of all, we have made some tests under `cqlsh`, in order to check that it really fits our needs. 
+
+=== Table creation
+
+The column definition is a list of frozen tuple, as explain in the *Cassandra* documentation, the `tuple` has to be `frozen`.
+[source,sql]
+.Table creation
+----
+cassandra@cqlsh:test> CREATE TABLE test (id int PRIMARY KEY, properties list<frozen<tuple<text, text, text>>>);
+----
+
+=== Inserting data
+
+Such operation is simple, we just have to insert a list of tuple which are surrounded by parentheses.
+
+[source,sql]
+.Inserting data
+----
+cassandra@cqlsh:test> INSERT INTO test.test (id, properties) VALUES (1, [ ('ns1', 'key1', 'value1'), ('ns1', 'key2', 'value2'), ('ns2', 'key1', 'value3') ]);
+----
+
+=== Retrieving data
+
+Nothing more to say than the example, data are well stored.
+
+[source,sql]
+.Retrieving data
+----
+cassandra@cqlsh:test> SELECT * FROM test;
+
+ id | properties
+----+-----------------------------------------------------------------------------------
+  1 | [('ns1', 'key1', 'value1'), ('ns1', 'key2', 'value2'), ('ns2', 'key1', 'value3')]
+
+(1 rows)
+----
+
+== Coding with Java
+
+[WARNING]
+====
+In this example, we use the 2.1.5 version of `cassandra-driver-core`. +
+You also need `Java` 8 to be installed.
+====
+
+[NOTE]
+====
+All the code in this article is available at https://github.com/aduprat/cassandra-tuple.git[Github]
+====
+
+=== Defining your data type
+
+First of all, we thought it easier in our code to use a constant in order to define the column.
+
+[source,java,linenums]
+----
+public static final TupleType PROPERTY_TYPE = TupleType.of(DataType.text(), DataType.text(), DataType.text());
+----
+
+=== Table creation
+
+Then, the table creation is a simple list of our predefined `TupleType`.
+
+[source,java,linenums]
+----
+private void createTableIfNotExists(Session session) {
+    Create tableCreation = SchemaBuilder.createTable(TABLE_NAME)
+        .ifNotExists()
+        .addPartitionKey(ID, DataType.cint())
+        .addColumn(PROPERTIES, DataType.list(PROPERTY_TYPE));
+    session.execute(tableCreation);
+}
+----
+
+=== Inserting data
+
+The `TupleType` API comes with the `newValue` method, which takes a `varargs` parameter. +
+The order of the given parameters match the order of the `TupleType` definition, hence, you just have to respect that ordering.
+
+[source,java,linenums]
+----
+public void save(int id, List<Property> properties) {
+    Insert query = QueryBuilder.insertInto(TABLE_NAME)
+            .value(ID, id)
+            .value(PROPERTIES, properties.stream()
+                    .map(x -> PROPERTY_TYPE.newValue(x.getNamespace(), x.getLocalName(), x.getValue()))
+                    .collect(Collectors.toList()));
+    session.execute(query);
+}
+----
+
+=== Retrieving data
+
+When retrieving data, you have to use the `getList` method from the `Row` class. +
+The first parameter correspond to the underling column, and the second to the class for the elements (`TupleValue` in our case).
+
+[source,java,linenums]
+----
+public List<Property> get(int id) {
+    Where query = QueryBuilder.select(PROPERTIES).from(TABLE_NAME)
+        .where(QueryBuilder.eq(ID, id));
+    
+    ResultSet result = session.execute(query);
+    if (result.isExhausted()) {
+        return ImmutableList.of();
+    }
+    
+    return result.one().getList(PROPERTIES, TupleValue.class).stream()
+        .map(x -> new Property(x.getString(0), x.getString(1), x.getString(2)))
+        .collect(Collectors.toList());
+}
+----
+
+[appendix]
+== Source code
+
+[source,java,linenums]
+----
+include::src/main/java/org/linagora/tuple/Property.java[]
+----
+[source,java,linenums]
+----
+include::src/main/java/org/linagora/tuple/Table.java[]
+----
+[source,java,linenums]
+----
+include::src/test/java/org/linagora/tuple/TableTest.java[]
+----
+[source,java,linenums]
+----
+include::pom.xml[]
+----
